@@ -4,6 +4,7 @@ path = require 'path'
 {join} = path
 {Emitter, Disposable, CompositeDisposable} = require 'event-kit'
 fs = require 'fs-plus'
+{Directory} = require 'pathwatcher'
 DefaultDirectorySearcher = require './default-directory-searcher'
 Model = require './model'
 TextEditor = require './text-editor'
@@ -189,7 +190,7 @@ class Workspace extends Model
     document.title = titleParts.join(" \u2014 ")
     @applicationDelegate.setRepresentedFilename(representedPath)
 
-  # On OS X, fades the application window's proxy icon when the current file
+  # On macOS, fades the application window's proxy icon when the current file
   # has been modified.
   updateDocumentEdited: =>
     modified = @getActivePaneItem()?.isModified?() ? false
@@ -548,10 +549,18 @@ class Workspace extends Model
         throw error
 
     @project.bufferForPath(filePath, options).then (buffer) =>
-      editor = @buildTextEditor(_.extend({buffer, largeFileMode}, options))
+      editor = @buildTextEditor(Object.assign({buffer, largeFileMode}, options))
       disposable = atom.textEditors.add(editor)
-      editor.onDidDestroy -> disposable.dispose()
+      grammarSubscription = editor.observeGrammar(@handleGrammarUsed.bind(this))
+      editor.onDidDestroy ->
+        grammarSubscription.dispose()
+        disposable.dispose()
       editor
+
+  handleGrammarUsed: (grammar) ->
+    return unless grammar?
+
+    @packageManager.triggerActivationHook("#{grammar.packageName}:grammar-used")
 
   # Public: Returns a {Boolean} that is `true` if `object` is a `TextEditor`.
   #
@@ -563,9 +572,8 @@ class Workspace extends Model
   #
   # Returns a {TextEditor}.
   buildTextEditor: (params) ->
-    params = _.extend({
-      @config, @notificationManager, @packageManager, @clipboard, @viewRegistry,
-      @grammarRegistry, @project, @assert, @applicationDelegate
+    params = Object.assign({
+      @config, @clipboard, @grammarRegistry, @assert
     }, params)
     new TextEditor(params)
 
@@ -581,7 +589,11 @@ class Workspace extends Model
 
   # Public: Register an opener for a uri.
   #
-  # An {TextEditor} will be used if no openers return a value.
+  # When a URI is opened via {Workspace::open}, Atom loops through its registered
+  # opener functions until one returns a value for the given uri.
+  # Openers are expected to return an object that inherits from HTMLElement or
+  # a model which has an associated view in the {ViewRegistry}.
+  # A {TextEditor} will be used if no opener returns a value.
   #
   # ## Examples
   #
@@ -1079,3 +1091,22 @@ class Workspace extends Model
 
       inProcessFinished = true
       checkFinished()
+
+  checkoutHeadRevision: (editor) ->
+    if editor.getPath()
+      checkoutHead = =>
+        @project.repositoryForDirectory(new Directory(editor.getDirectoryPath()))
+          .then (repository) ->
+            repository?.checkoutHeadForEditor(editor)
+
+      if @config.get('editor.confirmCheckoutHeadRevision')
+        @applicationDelegate.confirm
+          message: 'Confirm Checkout HEAD Revision'
+          detailedMessage: "Are you sure you want to discard all changes to \"#{editor.getFileName()}\" since the last Git commit?"
+          buttons:
+            OK: checkoutHead
+            Cancel: null
+      else
+        checkoutHead()
+    else
+      Promise.resolve(false)

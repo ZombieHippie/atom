@@ -31,6 +31,7 @@ ContextMenuManager = require './context-menu-manager'
 CommandInstaller = require './command-installer'
 Clipboard = require './clipboard'
 Project = require './project'
+TitleBar = require './title-bar'
 Workspace = require './workspace'
 PanelContainer = require './panel-container'
 Panel = require './panel'
@@ -185,7 +186,7 @@ class AtomEnvironment extends Model
 
     @clipboard = new Clipboard()
 
-    @project = new Project({notificationManager: @notifications, packageManager: @packages, @config})
+    @project = new Project({notificationManager: @notifications, packageManager: @packages, @config, @applicationDelegate})
 
     @commandInstaller = new CommandInstaller(@getVersion(), @applicationDelegate)
 
@@ -193,6 +194,7 @@ class AtomEnvironment extends Model
       @config, @project, packageManager: @packages, grammarRegistry: @grammars, deserializerManager: @deserializers,
       notificationManager: @notifications, @applicationDelegate, @clipboard, viewRegistry: @views, assert: @assert.bind(this)
     })
+
     @themes.workspace = @workspace
 
     @textEditors = new TextEditorRegistry
@@ -224,23 +226,25 @@ class AtomEnvironment extends Model
 
     @observeAutoHideMenuBar()
 
-    checkPortableHomeWritable = ->
+    checkPortableHomeWritable = =>
       responseChannel = "check-portable-home-writable-response"
       ipcRenderer.on responseChannel, (event, response) ->
         ipcRenderer.removeAllListeners(responseChannel)
-        atom.notifications.addWarning("#{response.message.replace(/([\\\.+\\-_#!])/g, '\\$1')}") if not response.writable
+        @notifications.addWarning("#{response.message.replace(/([\\\.+\\-_#!])/g, '\\$1')}") if not response.writable
+      @disposables.add new Disposable -> ipcRenderer.removeAllListeners(responseChannel)
       ipcRenderer.send('check-portable-home-writable', responseChannel)
 
     checkPortableHomeWritable()
 
   attachSaveStateListeners: ->
-    saveState = => @saveState({isUnloading: false}) unless @unloaded
-    debouncedSaveState = _.debounce(saveState, @saveStateDebounceInterval)
-    @document.addEventListener('mousedown', debouncedSaveState, true)
-    @document.addEventListener('keydown', debouncedSaveState, true)
+    saveState = _.debounce((=>
+      window.requestIdleCallback => @saveState({isUnloading: false}) unless @unloaded
+    ), @saveStateDebounceInterval)
+    @document.addEventListener('mousedown', saveState, true)
+    @document.addEventListener('keydown', saveState, true)
     @disposables.add new Disposable =>
-      @document.removeEventListener('mousedown', debouncedSaveState, true)
-      @document.removeEventListener('keydown', debouncedSaveState, true)
+      @document.removeEventListener('mousedown', saveState, true)
+      @document.removeEventListener('keydown', saveState, true)
 
   setConfigSchema: ->
     @config.setSchema null, {type: 'object', properties: _.clone(require('./config-schema'))}
@@ -255,7 +259,7 @@ class AtomEnvironment extends Model
     @deserializers.add(TextBuffer)
 
   registerDefaultCommands: ->
-    registerDefaultCommands({commandRegistry: @commands, @config, @commandInstaller})
+    registerDefaultCommands({commandRegistry: @commands, @config, @commandInstaller, notificationManager: @notifications, @project, @clipboard})
 
   registerDefaultViewProviders: ->
     @views.addViewProvider Workspace, (model, env) ->
@@ -548,10 +552,6 @@ class AtomEnvironment extends Model
   # Extended: Set the full screen state of the current window.
   setFullScreen: (fullScreen=false) ->
     @applicationDelegate.setWindowFullScreen(fullScreen)
-    if fullScreen
-      @document.body.classList.add("fullscreen")
-    else
-      @document.body.classList.remove("fullscreen")
 
   # Extended: Toggle the full screen state of the current window.
   toggleFullScreen: ->
@@ -655,6 +655,7 @@ class AtomEnvironment extends Model
 
   # Call this method when establishing a real application window.
   startEditorWindow: ->
+    @unloaded = false
     @loadState().then (state) =>
       @windowDimensions = state?.windowDimensions
       @displayWindow().then =>
@@ -675,6 +676,9 @@ class AtomEnvironment extends Model
         startTime = Date.now()
         @deserialize(state) if state?
         @deserializeTimings.atom = Date.now() - startTime
+
+        if process.platform is 'darwin' and @config.get('core.useCustomTitleBar')
+          @workspace.addHeaderPanel({item: new TitleBar({@workspace, @themes, @applicationDelegate})})
 
         @document.body.appendChild(@views.getView(@workspace))
         @backgroundStylesheet?.remove()
@@ -728,7 +732,7 @@ class AtomEnvironment extends Model
       @emitter.emit 'will-throw-error', eventObject
 
       if openDevTools
-        @openDevTools().then => @executeJavaScriptInDevTools('DevToolsAPI.showConsole()')
+        @openDevTools().then => @executeJavaScriptInDevTools('DevToolsAPI.showPanel("console")')
 
       @emitter.emit 'did-throw-error', {message, url, line, column, originalError}
 
@@ -842,16 +846,15 @@ class AtomEnvironment extends Model
     return Promise.resolve() unless @enablePersistence
 
     new Promise (resolve, reject) =>
-      window.requestIdleCallback =>
-        return if not @project
+      return if not @project
 
-        state = @serialize(options)
-        savePromise =
-          if storageKey = @getStateKey(@project?.getPaths())
-            @stateStore.save(storageKey, state)
-          else
-            @applicationDelegate.setTemporaryWindowState(state)
-        savePromise.catch(reject).then(resolve)
+      state = @serialize(options)
+      savePromise =
+        if storageKey = @getStateKey(@project?.getPaths())
+          @stateStore.save(storageKey, state)
+        else
+          @applicationDelegate.setTemporaryWindowState(state)
+      savePromise.catch(reject).then(resolve)
 
   loadState: ->
     if @enablePersistence
